@@ -17,9 +17,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/httpstream"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/txn2/kubefwd/pkg/fwdIp"
+	"github.com/txn2/kubefwd/pkg/fwdip"
+	"github.com/txn2/kubefwd/pkg/fwdmetrics"
 	"github.com/txn2/kubefwd/pkg/fwdnet"
 	"github.com/txn2/kubefwd/pkg/fwdpub"
+	"github.com/txn2/kubefwd/pkg/fwdtui"
+	"github.com/txn2/kubefwd/pkg/fwdtui/events"
 	"github.com/txn2/txeh"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,7 +82,7 @@ func (gpi *GlobalPodInformer) startInformer(namespace string) cache.InformerSync
 
 	podInformer := gpi.informers[namespace].Core().V1().Pods()
 
-	podInformer.Informer().AddEventHandler(
+	_, err := podInformer.Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			UpdateFunc: func(oldObj, newObj interface{}) {
 				oldPod, oldPodOk := oldObj.(*v1.Pod)
@@ -96,7 +99,7 @@ func (gpi *GlobalPodInformer) startInformer(namespace string) cache.InformerSync
 				}
 
 				if newPod.DeletionTimestamp != nil {
-					log.Warnf("Pod %s marked for deletion, resyncing the %s service pods.", oldPod.ObjectMeta.Name, pfo.ServiceFwd)
+					log.Warnf("Pod %s marked for deletion, resyncing the %s service pods.", oldPod.Name, pfo.ServiceFwd)
 					pfo.Stop()
 					pfo.ServiceFwd.SyncPodForwards(false)
 					gpi.removePod(oldPod.UID)
@@ -115,14 +118,17 @@ func (gpi *GlobalPodInformer) startInformer(namespace string) cache.InformerSync
 					return
 				}
 
-				log.Warnf("Pod %s deleted, resyncing the %s service pods.", deletedPod.ObjectMeta.Name, pfo.ServiceFwd)
+				log.Warnf("Pod %s deleted, resyncing the %s service pods.", deletedPod.Name, pfo.ServiceFwd)
 				pfo.Stop()
 				pfo.ServiceFwd.SyncPodForwards(false)
 				gpi.removePod(deletedPod.UID)
-				log.Debugf("After pod %s was deleted, the %s service pods have been resynced.", deletedPod.ObjectMeta.Name, pfo.ServiceFwd)
+				log.Debugf("After pod %s was deleted, the %s service pods have been resynced.", deletedPod.Name, pfo.ServiceFwd)
 			},
 		},
 	)
+	if err != nil {
+		log.Warnf("Failed to add event handler for namespace %s: %v", namespace, err)
+	}
 
 	go gpi.informers[namespace].Start(gpi.stopChannel)
 
@@ -196,7 +202,7 @@ func ResetGlobalPodInformer() {
 // parent service.
 type ServiceFWD interface {
 	String() string
-	SyncPodForwards(bool)
+	SyncPodForwards(force bool)
 }
 
 type HostFileWithLock struct {
@@ -204,26 +210,20 @@ type HostFileWithLock struct {
 	sync.Mutex
 }
 
-type HostsParams struct {
-	localServiceName string
-	nsServiceName    string
-	fullServiceName  string
-	svcServiceName   string
-}
-
 type PortForwardOpts struct {
 	Out        *fwdpub.Publisher
 	Config     restclient.Config
 	ClientSet  kubernetes.Interface
-	RESTClient restclient.RESTClient
+	RESTClient *restclient.RESTClient
 
-	Service    string
-	ServiceFwd ServiceFWD
-	PodName    string
-	PodUID     types.UID
-	PodPort    string
-	LocalIp    net.IP
-	LocalPort  string
+	Service       string
+	ServiceFwd    ServiceFWD
+	PodName       string
+	PodUID        types.UID
+	PodPort       string
+	ContainerName string
+	LocalIP       net.IP
+	LocalPort     string
 	// Timeout for the port-forwarding process
 	Timeout  int
 	HostFile *HostFileWithLock
@@ -247,7 +247,6 @@ type PortForwardOpts struct {
 	NamespaceN int
 
 	Domain         string
-	HostsParams    *HostsParams
 	Hosts          []string
 	ManualStopChan chan struct{} // Send a signal on this to stop the portforwarding
 	DoneChan       chan struct{} // Listen on this channel for when the shutdown is completed.
@@ -312,6 +311,9 @@ func (pfo *PortForwardOpts) PortForward() error {
 
 	// if need to set timeout, set it here.
 	// restClient.Client.Timeout = 32
+	if pfo.RESTClient == nil {
+		return fmt.Errorf("RESTClient is nil for pod %s", pfo.PodName)
+	}
 	req := pfo.RESTClient.Post().
 		Resource("pods").
 		Namespace(pfo.Namespace).
@@ -334,6 +336,13 @@ func (pfo *PortForwardOpts) PortForward() error {
 		close(downstreamStopChannel)
 		pfo.removeHosts()
 		pfo.removeInterfaceAlias()
+
+		// Unregister from metrics registry if TUI is enabled
+		if fwdtui.IsEnabled() {
+			serviceKey := pfo.Service + "." + pfo.Namespace + "." + pfo.Context
+			fwdmetrics.GetRegistry().UnregisterPortForward(serviceKey, pfo.PodName, pfo.LocalPort)
+		}
+
 		close(pfStopChannel)
 		close(cleanupDone)
 	}()
@@ -370,23 +379,99 @@ func (pfo *PortForwardOpts) PortForward() error {
 		pingTargetPodName: pfo.PodName,
 	}
 
+	// Wrap with metrics dialer if TUI is enabled
+	var finalDialer httpstream.Dialer = dialerWithPing
+	var pfMetrics *fwdmetrics.PortForwardMetrics
+	if fwdtui.IsEnabled() {
+		localIPStr := ""
+		if pfo.LocalIP != nil {
+			localIPStr = pfo.LocalIP.String()
+		}
+		pfMetrics = fwdmetrics.NewPortForwardMetrics(
+			pfo.Service,
+			pfo.Namespace,
+			pfo.Context,
+			pfo.PodName,
+			localIPStr,
+			pfo.LocalPort,
+			pfo.PodPort,
+		)
+		// Enable HTTP sniffing for request/response logging
+		pfMetrics.EnableHTTPSniffing(50)
+
+		finalDialer = fwdmetrics.NewMetricsDialer(dialerWithPing, pfMetrics)
+
+		// Register with metrics registry
+		serviceKey := pfo.Service + "." + pfo.Namespace + "." + pfo.Context
+		fwdmetrics.GetRegistry().RegisterPortForward(serviceKey, pfMetrics)
+	}
+
 	var address []string
-	if pfo.LocalIp != nil {
-		address = []string{pfo.LocalIp.To4().String(), pfo.LocalIp.To16().String()}
+	if pfo.LocalIP != nil {
+		address = []string{pfo.LocalIP.To4().String(), pfo.LocalIP.To16().String()}
 	} else {
 		address = []string{"localhost"}
 	}
 
-	fw, err := portforward.NewOnAddresses(dialerWithPing, address, fwdPorts, pfStopChannel, make(chan struct{}), &p, &p)
+	fw, err := portforward.NewOnAddresses(finalDialer, address, fwdPorts, pfStopChannel, make(chan struct{}), &p, &p)
 	if err != nil {
+		// Emit status change event for TUI
+		if fwdtui.IsEnabled() {
+			event := events.NewPodEvent(
+				events.PodStatusChanged,
+				pfo.Service,
+				pfo.Namespace,
+				pfo.Context,
+				pfo.PodName,
+				pfo.ServiceFwd.String(), // registryKey for reconnection lookup
+			)
+			event.LocalPort = pfo.LocalPort
+			event.Status = "error"
+			event.Error = err
+			fwdtui.Emit(event)
+		}
+
 		pfo.Stop()
 		<-cleanupDone
 		return err
 	}
 
+	// Emit active status - port forward is now ready
+	if fwdtui.IsEnabled() {
+		event := events.NewPodEvent(
+			events.PodStatusChanged,
+			pfo.Service,
+			pfo.Namespace,
+			pfo.Context,
+			pfo.PodName,
+			pfo.ServiceFwd.String(), // registryKey for reconnection lookup
+		)
+		event.LocalPort = pfo.LocalPort
+		event.Status = "active"
+		event.Hostnames = pfo.Hosts // Include hostnames now that AddHosts() has run
+		fwdtui.Emit(event)
+	}
+
 	// Blocking call
 	if err = fw.ForwardPorts(); err != nil {
 		log.Errorf("Lost connection to %s/%s: %s", pfo.Namespace, pfo.PodName, err.Error())
+
+		// Emit status change event for TUI
+		if fwdtui.IsEnabled() {
+			event := events.NewPodEvent(
+				events.PodStatusChanged,
+				pfo.Service,
+				pfo.Namespace,
+				pfo.Context,
+				pfo.PodName,
+				pfo.ServiceFwd.String(), // registryKey for reconnection lookup
+			)
+			event.LocalPort = pfo.LocalPort
+			event.Status = "error"
+			event.Error = err
+			fwdtui.Emit(event)
+		}
+
 		pfo.Stop()
 		dialerWithPing.stopPing()
 		<-cleanupDone
@@ -400,36 +485,16 @@ func (pfo *PortForwardOpts) PortForward() error {
 	return nil
 }
 
-//// BuildHostsParams constructs the basic hostnames for the service
-//// based on the PortForwardOpts configuration
-//func (pfo *PortForwardOpts) BuildHostsParams() {
-//
-//	localServiceName := pfo.Service
-//	nsServiceName := pfo.Service + "." + pfo.Namespace
-//	fullServiceName := fmt.Sprintf("%s.%s.svc.cluster.local", pfo.Service, pfo.Namespace)
-//	svcServiceName := fmt.Sprintf("%s.%s.svc", pfo.Service, pfo.Namespace)
-//
-//	// check if this is an additional cluster (remote from the
-//	// perspective of the user / argument order)
-//	if pfo.ClusterN > 0 {
-//		fullServiceName = fmt.Sprintf("%s.%s.svc.cluster.%s", pfo.Service, pfo.Namespace, pfo.Context)
-//	}
-//	pfo.HostsParams.localServiceName = localServiceName
-//	pfo.HostsParams.nsServiceName = nsServiceName
-//	pfo.HostsParams.fullServiceName = fullServiceName
-//	pfo.HostsParams.svcServiceName = svcServiceName
-//}
-
-// AddHost
+// addHost adds a hostname to the hosts file for this port forward
 func (pfo *PortForwardOpts) addHost(host string) {
 	pfo.Hosts = append(pfo.Hosts, host)
-	fwdIp.RegisterHostname(host)
+	fwdip.RegisterHostname(host)
 	pfo.HostFile.Hosts.RemoveHost(host)
-	pfo.HostFile.Hosts.AddHost(pfo.LocalIp.String(), host)
+	pfo.HostFile.Hosts.AddHost(pfo.LocalIP.String(), host)
 
 	sanitizedHost := sanitizeHost(host)
 	if host != sanitizedHost {
-		pfo.addHost(sanitizedHost) //should recurse only once
+		pfo.addHost(sanitizedHost) // should recurse only once
 	}
 }
 
@@ -601,7 +666,7 @@ func (pfo *PortForwardOpts) removeHosts() {
 
 // removeInterfaceAlias called on stop signal to
 func (pfo *PortForwardOpts) removeInterfaceAlias() {
-	fwdnet.RemoveInterfaceAlias(pfo.LocalIp)
+	fwdnet.RemoveInterfaceAlias(pfo.LocalIP)
 }
 
 func (pfo *PortForwardOpts) WaitUntilPodRunning(stopChannel <-chan struct{}) (*v1.Pod, error) {
@@ -640,8 +705,13 @@ func (pfo *PortForwardOpts) WaitUntilPodRunning(stopChannel <-chan struct{}) (*v
 	// watcher until the pod status is running
 	for {
 		event, ok := <-watcher.ResultChan()
-		if !ok || event.Type == "ERROR" {
-			break
+		if !ok {
+			// Channel closed - watch ended (timeout, stop signal, etc.)
+			return nil, nil
+		}
+		if event.Type == "ERROR" {
+			// Actual error from the API server
+			return nil, fmt.Errorf("watch error for pod %s: event type ERROR", pfo.PodName)
 		}
 		if event.Object != nil && event.Type == "MODIFIED" {
 			changedPod := event.Object.(*v1.Pod)
@@ -650,7 +720,6 @@ func (pfo *PortForwardOpts) WaitUntilPodRunning(stopChannel <-chan struct{}) (*v
 			}
 		}
 	}
-	return nil, nil
 }
 
 // Stop sends the shutdown signal to the port-forwarding process.
