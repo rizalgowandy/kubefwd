@@ -14,6 +14,24 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
+// waitForCondition polls the provided condition until it returns true or the timeout elapses.
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		if condition() {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("condition not met within %s", timeout)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // createMockServiceFWD creates a mock ServiceFWD for testing
 func createMockServiceFWD(name, namespace, context string) *fwdservice.ServiceFWD {
 	svc := &v1.Service{
@@ -30,7 +48,7 @@ func createMockServiceFWD(name, namespace, context string) *fwdservice.ServiceFW
 	}
 
 	return &fwdservice.ServiceFWD{
-		ClientSet:            fake.NewSimpleClientset(),
+		ClientSet:            fake.NewClientset(),
 		Svc:                  svc,
 		Namespace:            namespace,
 		Context:              context,
@@ -77,16 +95,13 @@ func TestAdd_SingleService(t *testing.T) {
 
 	Add(svc)
 
-	// Give time for async add
-	time.Sleep(50 * time.Millisecond)
-
-	svcRegistry.mutex.Lock()
-	_, found := svcRegistry.services[svc.String()]
-	svcRegistry.mutex.Unlock()
-
-	if !found {
-		t.Error("Expected service to be added to registry")
-	}
+	// Wait for async add to complete
+	waitForCondition(t, 1*time.Second, func() bool {
+		svcRegistry.mutex.Lock()
+		_, found := svcRegistry.services[svc.String()]
+		svcRegistry.mutex.Unlock()
+		return found
+	})
 }
 
 // TestAdd_DuplicateService tests that adding the same service twice is idempotent
@@ -104,15 +119,12 @@ func TestAdd_DuplicateService(t *testing.T) {
 	Add(svc)
 	Add(svc)
 
-	time.Sleep(50 * time.Millisecond)
-
-	svcRegistry.mutex.Lock()
-	count := len(svcRegistry.services)
-	svcRegistry.mutex.Unlock()
-
-	if count != 1 {
-		t.Errorf("Expected 1 service in registry, got %d", count)
-	}
+	waitForCondition(t, 1*time.Second, func() bool {
+		svcRegistry.mutex.Lock()
+		count := len(svcRegistry.services)
+		svcRegistry.mutex.Unlock()
+		return count == 1
+	})
 }
 
 // TestAdd_MultipleServices tests adding multiple different services
@@ -132,15 +144,12 @@ func TestAdd_MultipleServices(t *testing.T) {
 	Add(svc2)
 	Add(svc3)
 
-	time.Sleep(100 * time.Millisecond)
-
-	svcRegistry.mutex.Lock()
-	count := len(svcRegistry.services)
-	svcRegistry.mutex.Unlock()
-
-	if count != 3 {
-		t.Errorf("Expected 3 services in registry, got %d", count)
-	}
+	waitForCondition(t, 1*time.Second, func() bool {
+		svcRegistry.mutex.Lock()
+		count := len(svcRegistry.services)
+		svcRegistry.mutex.Unlock()
+		return count == 3
+	})
 }
 
 // TestAdd_AfterShutdown tests that adding after shutdown is a no-op
@@ -185,8 +194,8 @@ func TestAdd_ConcurrentAdds(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			svc := createMockServiceFWD(
-				"svc-"+string(rune('a'+n%26)),
-				"ns-"+string(rune('a'+n/26)),
+				fmt.Sprintf("svc-%d", n),
+				fmt.Sprintf("ns-%d", n),
 				"ctx",
 			)
 			Add(svc)
@@ -277,7 +286,7 @@ func TestRemoveByName_ConcurrentRemoves(t *testing.T) {
 	services := make([]*fwdservice.ServiceFWD, numServices)
 	for i := 0; i < numServices; i++ {
 		svc := createMockServiceFWD(
-			"svc-"+string(rune('a'+i%26)),
+			fmt.Sprintf("svc-%d", i),
 			"ns-"+string(rune('a'+i/26)),
 			"ctx",
 		)
@@ -326,7 +335,7 @@ func TestConcurrentAddRemove(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			svc := createMockServiceFWD(
-				"svc-"+string(rune('a'+(n%26))),
+				fmt.Sprintf("svc-%d", n),
 				"default",
 				"ctx",
 			)
@@ -340,7 +349,7 @@ func TestConcurrentAddRemove(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			time.Sleep(time.Millisecond * time.Duration(n%10))
-			name := "svc-" + string(rune('a'+(n%26))) + ".default.ctx"
+			name := fmt.Sprintf("svc-%d.default.ctx", n)
 			RemoveByName(name)
 		}(i)
 	}
@@ -529,6 +538,185 @@ func TestServiceNameUniqueness(t *testing.T) {
 
 	if !found1 || !found2 {
 		t.Error("Expected both services to be found by their full names")
+	}
+}
+
+// TestGet_ExistingService tests getting an existing service
+func TestGet_ExistingService(t *testing.T) {
+	shutdownChan := make(chan struct{})
+	Init(shutdownChan)
+	defer func() {
+		close(shutdownChan)
+		<-Done()
+	}()
+
+	svc := createMockServiceFWD("test-svc", "default", "test-ctx")
+	Add(svc)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Get the service
+	retrieved := Get(svc.String())
+
+	if retrieved == nil {
+		t.Fatal("Expected to get service")
+	}
+
+	if retrieved.String() != svc.String() {
+		t.Errorf("Expected service %s, got %s", svc.String(), retrieved.String())
+	}
+}
+
+// TestGet_NonExistentService tests getting a service that doesn't exist
+func TestGet_NonExistentService(t *testing.T) {
+	shutdownChan := make(chan struct{})
+	Init(shutdownChan)
+	defer func() {
+		close(shutdownChan)
+		<-Done()
+	}()
+
+	retrieved := Get("nonexistent.default.ctx")
+
+	if retrieved != nil {
+		t.Error("Expected nil for non-existent service")
+	}
+}
+
+// TestGetAll tests getting all services
+func TestGetAll(t *testing.T) {
+	shutdownChan := make(chan struct{})
+	Init(shutdownChan)
+	defer func() {
+		close(shutdownChan)
+		<-Done()
+	}()
+
+	// Add multiple services
+	svc1 := createMockServiceFWD("svc1", "default", "ctx")
+	svc2 := createMockServiceFWD("svc2", "default", "ctx")
+	svc3 := createMockServiceFWD("svc3", "kube-system", "ctx")
+
+	Add(svc1)
+	Add(svc2)
+	Add(svc3)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Get all services
+	all := GetAll()
+
+	if len(all) != 3 {
+		t.Errorf("Expected 3 services, got %d", len(all))
+	}
+
+	// Verify all services are present
+	found := make(map[string]bool)
+	for _, svc := range all {
+		found[svc.String()] = true
+	}
+
+	if !found["svc1.default.ctx"] {
+		t.Error("Expected svc1 in GetAll result")
+	}
+	if !found["svc2.default.ctx"] {
+		t.Error("Expected svc2 in GetAll result")
+	}
+	if !found["svc3.kube-system.ctx"] {
+		t.Error("Expected svc3 in GetAll result")
+	}
+}
+
+// TestGetAll_Empty tests getting all services when registry is empty
+func TestGetAll_Empty(t *testing.T) {
+	shutdownChan := make(chan struct{})
+	Init(shutdownChan)
+	defer func() {
+		close(shutdownChan)
+		<-Done()
+	}()
+
+	all := GetAll()
+
+	if len(all) != 0 {
+		t.Errorf("Expected 0 services, got %d", len(all))
+	}
+}
+
+// TestGetByNamespace tests getting services by namespace
+func TestGetByNamespace(t *testing.T) {
+	shutdownChan := make(chan struct{})
+	Init(shutdownChan)
+	defer func() {
+		close(shutdownChan)
+		<-Done()
+	}()
+
+	// Add services in different namespaces
+	svc1 := createMockServiceFWD("svc1", "default", "ctx")
+	svc2 := createMockServiceFWD("svc2", "default", "ctx")
+	svc3 := createMockServiceFWD("svc3", "kube-system", "ctx")
+	svc4 := createMockServiceFWD("svc4", "production", "ctx")
+
+	Add(svc1)
+	Add(svc2)
+	Add(svc3)
+	Add(svc4)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Get services in default namespace - GetByNamespace takes (namespace, context)
+	defaultServices := GetByNamespace("default", "ctx")
+
+	if len(defaultServices) != 2 {
+		t.Errorf("Expected 2 services in default namespace, got %d", len(defaultServices))
+	}
+
+	// Get services in kube-system namespace
+	kubeSystemServices := GetByNamespace("kube-system", "ctx")
+
+	if len(kubeSystemServices) != 1 {
+		t.Errorf("Expected 1 service in kube-system namespace, got %d", len(kubeSystemServices))
+	}
+
+	// Get services in non-existent namespace
+	nonExistentServices := GetByNamespace("nonexistent", "ctx")
+
+	if len(nonExistentServices) != 0 {
+		t.Errorf("Expected 0 services in nonexistent namespace, got %d", len(nonExistentServices))
+	}
+}
+
+// TestGetByNamespace_DifferentContexts tests getting services by namespace with different contexts
+func TestGetByNamespace_DifferentContexts(t *testing.T) {
+	shutdownChan := make(chan struct{})
+	Init(shutdownChan)
+	defer func() {
+		close(shutdownChan)
+		<-Done()
+	}()
+
+	// Add services in same namespace but different contexts
+	svc1 := createMockServiceFWD("svc1", "default", "ctx1")
+	svc2 := createMockServiceFWD("svc2", "default", "ctx2")
+
+	Add(svc1)
+	Add(svc2)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Get services in default namespace for ctx1 - GetByNamespace takes (namespace, context)
+	ctx1Services := GetByNamespace("default", "ctx1")
+
+	if len(ctx1Services) != 1 {
+		t.Errorf("Expected 1 service in default.ctx1, got %d", len(ctx1Services))
+	}
+
+	// Get services in default namespace for ctx2
+	ctx2Services := GetByNamespace("default", "ctx2")
+
+	if len(ctx2Services) != 1 {
+		t.Errorf("Expected 1 service in default.ctx2, got %d", len(ctx2Services))
 	}
 }
 

@@ -2,8 +2,12 @@
 .idea
 .DS_Store
 .vscode
+coverage.out
 dist
 vendor
 dist/
-kubefwd
+/kubefwd
+/kubefwd.*
 RELEASE_*
+NOTES_*
+site/
