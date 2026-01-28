@@ -1,18 +1,3 @@
-/*
-Copyright 2018 Craig Johnston <cjimti@gmail.com>
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package main
 
 import (
@@ -25,11 +10,28 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/txn2/kubefwd/cmd/kubefwd/mcp"
 	"github.com/txn2/kubefwd/cmd/kubefwd/services"
 	"k8s.io/klog/v2"
 )
 
-var globalUsage = ``
+var globalUsage = `Bulk forward Kubernetes services for local development.
+
+Each forwarded service gets its own unique loopback IP (127.x.x.x), allowing
+multiple services to use the same port simultaneously. Service names are added
+to /etc/hosts for transparent access using cluster service names.
+
+Modes:
+  Idle Mode:    Run without -n/--namespace; API enabled, no namespaces forwarded
+  Namespace:    Forward all services from specified namespace(s)
+  All:          Forward services from all namespaces (--all-namespaces)
+
+The REST API (http://kubefwd.internal/) is auto-enabled in idle mode and allows
+adding/removing namespaces and services dynamically.
+
+Subcommands:
+  mcp           Start MCP server for AI assistant integration (no sudo needed)
+  version       Show version information`
 var Version = "0.0.0"
 
 // KlogWriter captures klog output and reformats it through logrus
@@ -63,9 +65,7 @@ func (w *KlogWriter) Write(p []byte) (n int, err error) {
 	}
 
 	// Log any other unexpected klog messages at debug level
-	if msg != "" {
-		log.Debugf("k8s: %s", msg)
-	}
+	log.Debugf("k8s: %s", msg)
 
 	return len(p), nil
 }
@@ -84,7 +84,7 @@ func init() {
 	}
 
 	log.SetOutput(&LogOutputSplitter{})
-	if len(args) > 0 && (args[0] == "completion" || args[0] == "__complete") {
+	if len(args) > 0 && (args[0] == "completion" || args[0] == "__complete" || args[0] == "mcp") {
 		log.SetOutput(io.Discard)
 	}
 }
@@ -93,17 +93,14 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "kubefwd",
 		Short: "Expose Kubernetes services for local development.",
-		Example: " kubefwd services --help\n" +
-			"  kubefwd svc -n the-project\n" +
-			"  kubefwd svc -n the-project -l env=dev,component=api\n" +
-			"  kubefwd svc -n the-project -f metadata.name=service-name\n" +
-			"  kubefwd svc -n default -l \"app in (ws, api)\"\n" +
-			"  kubefwd svc -n default -n the-project\n" +
-			"  kubefwd svc -n the-project -m 80:8080 -m 443:1443\n" +
-			"  kubefwd svc -n the-project -z path/to/conf.yml\n" +
-			"  kubefwd svc -n the-project -r svc.ns:127.3.3.1\n" +
-			"  kubefwd svc --all-namespaces\n" +
-			"  kubefwd svc --hosts-path /etc/hosts",
+		Example: `  sudo kubefwd                      # Idle mode (API enabled, no namespaces)
+  sudo kubefwd --tui                # Idle mode with TUI
+  sudo kubefwd -n myapp             # Forward services from 'myapp' namespace
+  sudo kubefwd -n ns1 -n ns2        # Forward from multiple namespaces
+  sudo kubefwd -A                   # Forward from all namespaces
+  sudo kubefwd -n myapp -l app=web  # Filter by label selector
+  kubefwd mcp                       # Start MCP server for AI integration
+  kubefwd version                   # Show version`,
 
 		Long: globalUsage,
 	}
@@ -114,12 +111,18 @@ func newRootCmd() *cobra.Command {
 		Example: " kubefwd version\n" +
 			" kubefwd version quiet\n",
 		Long: ``,
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("Kubefwd version: %s\nhttps://github.com/txn2/kubefwd\n", Version)
+		Run: func(_ *cobra.Command, _ []string) {
+			fmt.Printf("Kubefwd version: %s\nhttps://kubefwd.com\n", Version)
 		},
 	}
 
-	cmd.AddCommand(versionCmd, services.Cmd)
+	// Pass version to services package for TUI header
+	services.Version = Version
+
+	// Pass version to mcp package
+	mcp.Version = Version
+
+	cmd.AddCommand(versionCmd, services.Cmd, mcp.Cmd)
 
 	return cmd
 }
@@ -133,23 +136,67 @@ func (splitter *LogOutputSplitter) Write(p []byte) (n int, err error) {
 	return os.Stdout.Write(p)
 }
 
-func main() {
+// isTUIMode checks if --tui flag is present in args
+func isTUIMode() bool {
+	for _, arg := range os.Args {
+		if arg == "--tui" {
+			return true
+		}
+	}
+	return false
+}
 
+// isMCPMode checks if running the mcp subcommand
+func isMCPMode() bool {
+	for _, arg := range os.Args[1:] {
+		if arg == "mcp" {
+			return true
+		}
+		// Stop at first non-flag argument
+		if !strings.HasPrefix(arg, "-") {
+			break
+		}
+	}
+	return false
+}
+
+// isKnownSubcommand checks if arg is a known subcommand
+func isKnownSubcommand(arg string) bool {
+	knownCommands := map[string]bool{
+		"services": true, "svcs": true, "svc": true,
+		"version": true, "mcp": true,
+		"help": true, "completion": true, "__complete": true,
+	}
+	return knownCommands[arg]
+}
+
+func main() {
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp:   true,
 		ForceColors:     true,
 		TimestampFormat: "15:04:05",
 	})
 
-	log.Print(` _          _           __             _`)
-	log.Print(`| | ___   _| |__   ___ / _|_      ____| |`)
-	log.Print(`| |/ / | | | '_ \ / _ \ |_\ \ /\ / / _  |`)
-	log.Print(`|   <| |_| | |_) |  __/  _|\ V  V / (_| |`)
-	log.Print(`|_|\_\\__,_|_.__/ \___|_|   \_/\_/ \__,_|`)
-	log.Print("")
-	log.Printf("Version %s", Version)
-	log.Print("https://github.com/txn2/kubefwd")
-	log.Print("")
+	// If no subcommand provided, default to "svc" (services command)
+	// This enables `sudo -E kubefwd` to work directly as idle mode
+	args := os.Args[1:]
+	if len(args) == 0 || (len(args) > 0 && !isKnownSubcommand(args[0])) {
+		// No args, or first arg is a flag/unknown - prepend "svc"
+		os.Args = append([]string{os.Args[0], "svc"}, args...)
+	}
+
+	// Only print banner in non-TUI, non-MCP mode
+	if !isTUIMode() && !isMCPMode() {
+		log.Print(` _          _           __             _`)
+		log.Print(`| | ___   _| |__   ___ / _|_      ____| |`)
+		log.Print(`| |/ / | | | '_ \ / _ \ |_\ \ /\ / / _  |`)
+		log.Print(`|   <| |_| | |_) |  __/  _|\ V  V / (_| |`)
+		log.Print(`|_|\_\\__,_|_.__/ \___|_|   \_/\_/ \__,_|`)
+		log.Print("")
+		log.Printf("Version %s", Version)
+		log.Print("https://kubefwd.com")
+		log.Print("")
+	}
 
 	cmd := newRootCmd()
 

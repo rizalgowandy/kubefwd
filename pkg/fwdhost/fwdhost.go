@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 
-	"github.com/txn2/kubefwd/pkg/fwdIp"
+	"github.com/txn2/kubefwd/pkg/fwdip"
 	"github.com/txn2/txeh"
 )
 
@@ -34,7 +34,7 @@ func BackupHostFile(hostFile *txeh.Hosts, forceRefresh bool) (string, error) {
 	}
 	defer func() { _ = from.Close() }()
 
-	to, err := os.OpenFile(backupHostsPath, os.O_RDWR|os.O_CREATE, 0644)
+	to, err := os.OpenFile(backupHostsPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return "", err
 	}
@@ -48,7 +48,7 @@ func BackupHostFile(hostFile *txeh.Hosts, forceRefresh bool) (string, error) {
 }
 
 func RemoveAllocatedHosts() error {
-	hostnames := fwdIp.GetRegisteredHostnames()
+	hostnames := fwdip.GetRegisteredHostnames()
 	if len(hostnames) == 0 {
 		return nil
 	}
